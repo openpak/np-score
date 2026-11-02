@@ -11,6 +11,7 @@ import (
 	"openpak/np-common/coreclient"
 	"openpak/np-common/nphttp"
 	"openpak/np-common/ticket"
+	"openpak/np-score/internal/rankingsapi"
 	"os"
 	"os/signal"
 	"syscall"
@@ -72,6 +73,7 @@ func run() error {
 		RecordFQDN: nphttp.Env("NP_RANKING_RECORD_FQDN", "ranking-record.np.community.playstation.net"),
 		ViewFQDN:   nphttp.Env("NP_RANKING_VIEW_FQDN", "ranking-view.np.community.playstation.net"), Log: log}
 	log.Info("score titles loaded", "count", len(titles))
+	rankingsapi.Serve(os.Getenv("RANKINGS_ADDR"), "np", rankingSource{store: store, titles: titles})
 	mux := http.NewServeMux()
 	svc.Register(mux)
 	nphttp.Health(mux)

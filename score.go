@@ -56,8 +56,9 @@ type Core interface {
 
 // Board is the per-board configuration a title's developer set on Sony's side.
 type Board struct {
-	Ascending bool   `json:"ascending"`    // lower scores rank higher (times)
-	Force     bool   `json:"force_update"` // every record replaces the previous one
+	Name      string `json:"name,omitempty"` // shown on the website rankings
+	Ascending bool   `json:"ascending"`      // lower scores rank higher (times)
+	Force     bool   `json:"force_update"`   // every record replaces the previous one
 	RankLimit uint32 `json:"rank_limit"`
 	DataLimit uint32 `json:"data_limit"`
 	SizeLimit uint32 `json:"size_limit"`
@@ -65,6 +66,7 @@ type Board struct {
 
 // Title holds the 128-byte communication passphrase (hex) that keys view reply signatures.
 type Title struct {
+	Name       string           `json:"name,omitempty"` // shown on the website rankings
 	Passphrase string           `json:"passphrase"`
 	Boards     map[string]Board `json:"boards"`
 }

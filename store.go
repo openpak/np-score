@@ -150,3 +150,28 @@ func (s *Store) Data(ctx context.Context, commid string, board int, account stri
 	}
 	return data, err
 }
+
+// BoardRef names one stored board.
+type BoardRef struct {
+	CommID string
+	Board  int
+}
+
+// Boards lists every (title, board) that holds at least one record.
+func (s *Store) Boards(ctx context.Context) ([]BoardRef, error) {
+	rows, err := s.DB.Query(ctx, `SELECT DISTINCT commid, board FROM scores ORDER BY commid, board`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BoardRef
+	for rows.Next() {
+		var c string
+		var b int
+		if err := rows.Scan(&c, &b); err != nil {
+			return nil, err
+		}
+		out = append(out, BoardRef{c, b})
+	}
+	return out, rows.Err()
+}

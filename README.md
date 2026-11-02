@@ -37,8 +37,17 @@ communication passphrase, which lives in the game executable. `NP_SCORE_TITLES` 
 ```
 
 Board fields: `ascending` (lower ranks higher), `force_update` (every record replaces the last),
-`rank_limit`, `data_limit`, `size_limit`. A title missing from the file can still record scores, but
+`rank_limit`, `data_limit`, `size_limit`, and an optional display `name` (also allowed on the title). A title missing from the file can still record scores, but
 the console rejects its leaderboard views.
+
+## Rankings for the website
+
+Set `RANKINGS_ADDR` (for example `:9090`) to serve the rankings contract (`/internal/rankings/boards`,
+`/boards/{id}`) on the container network; empty means off. Board ids are `<communication id>.<board>`
+and rows carry `account_id` (the OpenPak account id the scores table keys players by), network `np`.
+Boards are named from the optional `name` fields in the titles file (title and board) and fall back
+to the communication id and `Board N`. Every board is a plain score board; its order follows
+`ascending`.
 
 ## Run
 
