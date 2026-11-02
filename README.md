@@ -53,6 +53,7 @@ Tests need PostgreSQL: `NP_SCORE_TEST_DATABASE_URL=postgres://… GOWORK=off go 
 ## Docs
 
 - [Protocol](docs/protocol.md)
+- [Deploy](docs/deploy.md)
 
 ## Licence
 
