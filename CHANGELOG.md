@@ -1,5 +1,9 @@
 # Changelog: np-score
 
+## 0.2.1
+
+- README: Terraria title configuration example (five named boards, descending).
+
 ## 0.2.0
 
 - Rankings contract (`/internal/rankings/boards`, `/boards/{id}`) over the scores table, on its own
