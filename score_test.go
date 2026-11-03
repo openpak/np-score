@@ -13,40 +13,23 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"openpak/np-common/coreclient"
 	"openpak/np-common/fakecore"
 	"openpak/np-common/identity"
 	"openpak/np-common/resource"
 	"openpak/np-common/ticket"
+	"openpak/np-score/internal/fakeleaderboards"
 )
 
 const commid = "NPWR01234_00"
 
 func TestScore(t *testing.T) {
-	dbURL := os.Getenv("NP_SCORE_TEST_DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("NP_SCORE_TEST_DATABASE_URL not set")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	store := &Store{DB: pool}
-	if err = store.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, "TRUNCATE scores"); err != nil {
-		t.Fatal(err)
-	}
 
 	const coreKey = "test-core-key-at-least-thirty-two-bytes"
 	const alice, bob, carol = "0b7c3f4e-1d2a-4c5b-9e8f-112233445566", "1b7c3f4e-1d2a-4c5b-9e8f-112233445566", "2b7c3f4e-1d2a-4c5b-9e8f-112233445566"
@@ -55,6 +38,13 @@ func TestScore(t *testing.T) {
 	fake.AddAccount(fakecore.Account{ID: bob, DisplayName: "Bobby", Country: "US"})
 	fake.AddAccount(fakecore.Account{ID: carol, DisplayName: "Carol", Country: "US"})
 	fake.AddFriend(alice, bob)
+	lbFake := fakeleaderboards.New("lb-key")
+	lbFake.AddFriend(alice, bob)
+	lb, lbConn, err := DialLeaderboards("passthrough:///lb", "lb-key", lbFake.Serve(t)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lbConn.Close()
 	core, err := coreclient.Dial("passthrough:///core", coreKey, fake.Serve(t)...)
 	if err != nil {
 		t.Fatal(err)
@@ -80,8 +70,19 @@ func TestScore(t *testing.T) {
 	pass := bytes.Repeat([]byte{0x5a}, 128)
 	resourceKey := bytes.Repeat([]byte{7}, 20)
 	mux := http.NewServeMux()
-	(&Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey, RecordFQDN: "rec.example", ViewFQDN: "view.example", Log: slog.Default(),
-		Titles: map[string]Title{commid: {Passphrase: hex.EncodeToString(pass), Boards: map[string]Board{"2": {Ascending: true}}}}}).Register(mux)
+	svc := &Service{Core: core, Tickets: signer, LB: lb, ResourceKey: resourceKey, RecordFQDN: "rec.example", ViewFQDN: "view.example", Log: slog.Default(),
+		Titles: map[string]Title{commid: {Passphrase: hex.EncodeToString(pass), Boards: map[string]Board{"2": {Ascending: true}, "5": {Force: true}}}}}
+	svc.Register(mux)
+	// Configured boards are declared to the leaderboards service at start.
+	if err := svc.SyncBoards(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := lbFake.Policy(commid, "2"); lbFake.Synced != 2 || p == nil || p.Order != "asc" || p.Aggregation != "best" {
+		t.Fatalf("board sync: %d %v", lbFake.Synced, p)
+	}
+	if p := lbFake.Policy(commid, "5"); p == nil || p.Aggregation != "latest" {
+		t.Fatalf("force board: %v", p)
+	}
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -187,4 +188,16 @@ func TestScore(t *testing.T) {
 
 	r, _ = post("/ranking_update/sec/record_score", `<ticket>AAAA</ticket>`+head+`<pc>0</pc><score>1</score>`, nil)
 	expect(r, `result="02"`)
+
+	// A force board replaces the score even when it is worse.
+	record(alice, 5, 100)
+	expect(record(alice, 5, 40), `<temp-rank>1</temp-rank>`)
+	r, _ = post("/ranking_view/func/get_ranking", `<titleid>`+commid+`</titleid><board>5</board><start>1</start><list-max>5</list-max><option message="false" info="false"/>`, nil)
+	expect(r, `<score>40</score>`)
+
+	// The record keeps the jid it was written under, and a downed leaderboards service is an
+	// internal error, never a hang or a wrong answer.
+	lbFake.Down = true
+	r, _ = post("/ranking_view/func/get_ranking", head+`<start>1</start><list-max>5</list-max><option message="false" info="false"/>`, nil)
+	expect(r, `result="07"`)
 }

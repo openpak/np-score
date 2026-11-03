@@ -6,7 +6,7 @@ OpenPak's PS3 Score (leaderboard) server.
 | --- | --- |
 | Network | PlayStation 3 |
 | Role | Native PS3 `/ranking_update/*` and `/ranking_view/*` (score boards, comments, game info, game data) and the signed ranking discovery resource |
-| Depends on | [`account`](https://github.com/openpak/account) (account core), [`np-common`](https://github.com/openpak/np-common) (vendored), PostgreSQL |
+| Depends on | [`account`](https://github.com/openpak/account) (account core), [`np-common`](https://github.com/openpak/np-common) (vendored), [`leaderboards`](https://github.com/openpak/leaderboards) (gRPC; holds every score) |
 | Used by | [`np-account`](https://github.com/openpak/np-account) |
 | Image | `ghcr.io/openpak/np-score` |
 | Licence | AGPL-3.0-only |
@@ -59,14 +59,18 @@ game executable (`research/ps3/terraria-leaderboards.md` in the research repo). 
 }
 ```
 
-## Rankings for the website
+## Storage and the website
 
-Set `RANKINGS_ADDR` (for example `:9090`) to serve the rankings contract (`/internal/rankings/boards`,
-`/boards/{id}`) on the container network; empty means off. Board ids are `<communication id>.<board>`
-and rows carry `account_id` (the OpenPak account id the scores table keys players by), network `np`.
-Boards are named from the optional `name` fields in the titles file (title and board) and fall back
-to the communication id and `Board N`. Every board is a plain score board; its order follows
-`ascending`.
+np-score keeps no scores. Every record, rank, comment and game data blob lives in the neutral
+[`leaderboards`](https://github.com/openpak/leaderboards) service (PS3 is network `np`, the
+communication id is the title, the board number the board id, the pcId the entry's sub slot), so a
+PS3 score is visible across networks unless a board sets `"cross_network": false` in the titles
+file. At start np-score declares the configured boards (order, force update, limits, names) to it;
+`leaderboards` serves the website's rankings contract itself
+(`http://openpak-leaderboards:20210/t/<title>`), so np-score has no rankings listener.
+
+Set `NP_LEADERBOARDS_ADDR` (`host:port`, gRPC) and `NP_LEADERBOARDS_KEY` (its internal key).
+Terraria (`NPWR04270_00`) maps to the neutral title `terraria`.
 
 ## Run
 
@@ -76,7 +80,7 @@ set -a; . ./.env; set +a
 GOWORK=off go run -mod=vendor .
 ```
 
-Tests need PostgreSQL: `NP_SCORE_TEST_DATABASE_URL=postgres://… GOWORK=off go test -mod=vendor ./...`
+Tests run against an in-process fake leaderboards server: `GOWORK=off go test -mod=vendor ./...`
 
 ## Docs
 

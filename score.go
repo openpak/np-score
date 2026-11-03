@@ -17,10 +17,13 @@ import (
 	"strings"
 	"time"
 
-	accountv1 "github.com/openpak/account-api/openpak/account/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"openpak/np-common/coreclient"
 	"openpak/np-common/resource"
 	"openpak/np-common/ticket"
+	pb "openpak/np-score/internal/leaderboardspb"
 )
 
 // Wire format: research notes "score-protocol" (firmware 4.93 VSH). Replies are always HTTP 200
@@ -51,7 +54,6 @@ type Core interface {
 	ticket.AccountCore
 	GetLinkByOnlineID(context.Context, string) (*coreclient.Link, error)
 	GetLinkByAccount(context.Context, string) (*coreclient.Link, error)
-	Friends(context.Context, string) ([]*accountv1.Friend, error)
 }
 
 // Board is the per-board configuration a title's developer set on Sony's side.
@@ -62,6 +64,8 @@ type Board struct {
 	RankLimit uint32 `json:"rank_limit"`
 	DataLimit uint32 `json:"data_limit"`
 	SizeLimit uint32 `json:"size_limit"`
+	// CrossNetwork false keeps this board's entries to PS3 players; unset follows the core default (shared).
+	CrossNetwork *bool `json:"cross_network,omitempty"`
 }
 
 // Title holds the 128-byte communication passphrase (hex) that keys view reply signatures.
@@ -74,8 +78,8 @@ type Title struct {
 type Service struct {
 	Core        Core
 	Tickets     *ticket.Signer
-	Store       *Store
-	ResourceKey []byte // ranking resource key, firmware key at VSH 0x684030
+	LB          pb.LeaderboardsClient // the neutral leaderboards service
+	ResourceKey []byte                // ranking resource key, firmware key at VSH 0x684030
 	Titles      map[string]Title
 	RecordFQDN  string
 	ViewFQDN    string
@@ -223,16 +227,16 @@ func (s *Service) recordScore(c *call) {
 		s.reply(c, resultBadRequest, nil, nil)
 		return
 	}
-	b := s.board(c.req.TitleID, c.req.Board)
-	stored, rank, err := s.Store.Put(c.r.Context(), c.req.TitleID, c.req.Board, b.Ascending, b.Force, Record{
-		Account: c.actor.AccountID, PC: c.req.PC, Score: c.req.Score, JID: c.actorJID,
-		Name: c.actor.OnlineID, Comment: c.req.Message, Info: info,
+	res, err := s.LB.Submit(c.r.Context(), &pb.SubmitRequest{
+		Ref: ref(c.req.TitleID, c.req.Board), Account: c.actor.AccountID, Sub: int32(c.req.PC), Score: c.req.Score,
+		Comment: c.req.Message, Info: info, DisplayName: c.actorJID,
+		CreatePolicy: s.board(c.req.TitleID, c.req.Board).policy(),
 	})
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
-	if !stored {
+	if !res.Changed {
 		s.reply(c, resultNotBest, nil, nil)
 		return
 	}
@@ -240,7 +244,7 @@ func (s *Service) recordScore(c *call) {
 	if c.req.TempRank.Use == "1" {
 		inner = struct {
 			Rank int `xml:"temp-rank"`
-		}{rank}
+		}{int(res.Entry.Rank)}
 	}
 	s.reply(c, resultOK, inner, nil)
 }
@@ -255,19 +259,23 @@ func (s *Service) recordData(c *call) {
 		s.reply(c, resultTooLarge, nil, nil)
 		return
 	}
-	ok, err := s.Store.SetData(c.r.Context(), c.req.TitleID, c.req.Board, c.actor.AccountID, c.req.PC, c.req.Score, c.data)
+	res, err := s.LB.SetData(c.r.Context(), &pb.SetDataRequest{Ref: ref(c.req.TitleID, c.req.Board), Account: c.actor.AccountID,
+		Sub: int32(c.req.PC), ExpectScore: c.req.Score, Data: c.data})
+	if status.Code(err) == codes.ResourceExhausted {
+		s.reply(c, resultTooLarge, nil, nil)
+		return
+	}
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
-	if !ok {
+	if !res.Stored {
 		s.reply(c, resultBadScore, nil, nil)
 		return
 	}
 	s.reply(c, resultOK, nil, nil)
 }
 
-// account resolves a request <jid> to a core account, "" when unknown.
 func (s *Service) account(ctx context.Context, jid string) (string, error) {
 	online, _, _ := strings.Cut(jid, "@")
 	link, err := s.Core.GetLinkByOnlineID(ctx, online)
@@ -298,9 +306,13 @@ func (s *Service) getGameData(c *call) {
 	}
 	var data []byte
 	if account != "" {
-		if data, err = s.Store.Data(c.r.Context(), c.req.TitleID, c.req.Board, account, pcID(c.req.JIDs[0].PC)); err != nil {
+		res, err := s.LB.GetData(c.r.Context(), &pb.GetDataRequest{Ref: ref(c.req.TitleID, c.req.Board), Account: account, Sub: int32(pcID(c.req.JIDs[0].PC))})
+		if err != nil {
 			s.fail(c, err)
 			return
+		}
+		if res.Found {
+			data = res.Data
 		}
 	}
 	if data == nil {
@@ -335,18 +347,16 @@ func (s *Service) sanitizeComment(c *call) {
 }
 
 func (s *Service) getRanking(c *call) {
-	b := s.board(c.req.TitleID, c.req.Board)
 	n := min(max(c.req.ListMax, 1), maxList)
-	recs, err := s.Store.Range(c.r.Context(), c.req.TitleID, c.req.Board, b.Ascending, max(c.req.Start, 1), n)
+	res, err := s.LB.Range(c.r.Context(), &pb.RangeRequest{Ref: ref(c.req.TitleID, c.req.Board), Start: int64(max(c.req.Start, 1)), Limit: int64(n)})
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
-	s.list(c, recs, -1, true)
+	s.list(c, res.Entries, res.Total, -1, true)
 }
 
 func (s *Service) getPlayerRank(c *call) {
-	b := s.board(c.req.TitleID, c.req.Board)
 	want := map[string]int{} // account -> pc
 	for _, j := range c.req.JIDs {
 		account, err := s.account(c.r.Context(), j.JID)
@@ -362,59 +372,50 @@ func (s *Service) getPlayerRank(c *call) {
 	for a := range want {
 		accounts = append(accounts, a)
 	}
-	recs, err := s.Store.Accounts(c.r.Context(), c.req.TitleID, c.req.Board, b.Ascending, accounts)
-	if err != nil {
-		s.fail(c, err)
-		return
-	}
-	var out []Record
-	for _, r := range recs {
-		if want[r.Account] == r.PC {
-			out = append(out, r)
+	var out []*pb.Entry
+	var total int64
+	if len(accounts) == 0 {
+		res, err := s.LB.Total(c.r.Context(), &pb.TotalRequest{Ref: ref(c.req.TitleID, c.req.Board)})
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		total = res.Total
+	} else {
+		res, err := s.LB.ByAccounts(c.r.Context(), &pb.ByAccountsRequest{Ref: ref(c.req.TitleID, c.req.Board), Accounts: accounts})
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		total = res.Total
+		for _, e := range res.Entries {
+			if want[e.Account] == int(e.Sub) {
+				out = append(out, e)
+			}
 		}
 	}
 	if len(out) == 0 {
 		// ponytail: VSH rejects an empty list here; a record matching nobody leaves every
 		// requested player "not ranked". Unknown what Sony sent (research notes, unknown 3).
-		out = []Record{{JID: "openpak-none@us.np.community.playstation.net", Name: "openpak-none", Updated: time.Now()}}
+		out = []*pb.Entry{{DisplayName: "openpak-none@us.np.community.playstation.net", UpdatedUnixMs: time.Now().UnixMilli()}}
 	}
-	s.list(c, out, -1, false)
+	s.list(c, out, total, -1, false)
 }
 
 func (s *Service) getFriendPlayerRank(c *call) {
-	b := s.board(c.req.TitleID, c.req.Board)
-	fs, err := s.Core.Friends(c.r.Context(), c.actor.AccountID)
-	if err != nil {
-		s.reply(c, resultInternal, nil, nil)
-		return
-	}
-	var accounts []string
-	if c.req.Option.Owner == "true" {
-		accounts = append(accounts, c.actor.AccountID)
-	}
-	for _, f := range fs {
-		accounts = append(accounts, f.AccountId)
-	}
-	recs, err := s.Store.Accounts(c.r.Context(), c.req.TitleID, c.req.Board, b.Ascending, accounts)
-	if err != nil {
-		s.fail(c, err)
-		return
-	}
-	// ponytail: one entry per player (their best pcId); ranks stay global.
-	seen := map[string]bool{}
-	var best []Record
-	for _, r := range recs {
-		if !seen[r.Account] {
-			seen[r.Account] = true
-			best = append(best, r)
-		}
-	}
-	offset := min(max(c.req.Option.Offset, 0), len(best))
 	limit := c.req.Option.Limit
 	if limit <= 0 || limit > maxList {
 		limit = maxList
 	}
-	s.list(c, best[offset:min(offset+limit, len(best))], len(best), false)
+	// The core asks the account core for the friend list and keeps one entry per player (their
+	// best pcId); ranks stay global.
+	res, err := s.LB.FriendRanks(c.r.Context(), &pb.FriendRanksRequest{Ref: ref(c.req.TitleID, c.req.Board), Account: c.actor.AccountID,
+		IncludeSelf: c.req.Option.Owner == "true", Offset: int64(max(c.req.Option.Offset, 0)), Limit: int64(limit)})
+	if err != nil {
+		s.reply(c, resultInternal, nil, nil)
+		return
+	}
+	s.list(c, res.Entries, res.Total, int(res.Hits), false)
 }
 
 type recordXML struct {
@@ -434,18 +435,15 @@ type recordXML struct {
 	Info    *string `xml:"info,omitempty"`
 }
 
-// list writes update/total/[hits]/list for the ranking queries.
-func (s *Service) list(c *call, recs []Record, hits int, maxRank bool) {
-	total, err := s.Store.Total(c.r.Context(), c.req.TitleID, c.req.Board)
-	if err != nil {
-		s.fail(c, err)
-		return
-	}
+// list writes update/total/[hits]/list for the ranking queries. The jid is the one the entry was
+// recorded under (the core keeps it as the entry's display name).
+func (s *Service) list(c *call, recs []*pb.Entry, total int64, hits int, maxRank bool) {
 	items := make([]recordXML, len(recs))
 	for i, r := range recs {
 		x := &items[i]
-		x.Serial, x.Rank, x.Score, x.Name, x.Date = r.Serial, r.Rank, r.Score, r.Name, r.Updated.UTC().Format(dateFmt)
-		x.JID.PC, x.JID.JID = strconv.FormatInt(int64(r.PC), 16), r.JID
+		x.Serial, x.Rank, x.Score, x.Name = int(r.Position), int(r.Rank), r.Score, onlineID(r.DisplayName)
+		x.Date = time.UnixMilli(r.UpdatedUnixMs).UTC().Format(dateFmt)
+		x.JID.PC, x.JID.JID = strconv.FormatInt(int64(r.Sub), 16), r.DisplayName
 		if r.HasData {
 			x.Data = 1
 		}
@@ -453,7 +451,8 @@ func (s *Service) list(c *call, recs []Record, hits int, maxRank bool) {
 			x.MaxRank = &x.Rank
 		}
 		if c.req.Option.Message == "true" {
-			x.Message = &r.Comment
+			msg := r.Comment
+			x.Message = &msg
 		}
 		if c.req.Option.Info == "true" {
 			info := base64.StdEncoding.EncodeToString(r.Info)
@@ -472,7 +471,7 @@ func (s *Service) list(c *call, recs []Record, hits int, maxRank bool) {
 			Number  int         `xml:"number,attr"`
 			Records []recordXML `xml:"record"`
 		} `xml:"list"`
-	}{Update: time.Now().UTC().Format(dateFmt), Total: total, Hits: hitsPtr, List: struct {
+	}{Update: time.Now().UTC().Format(dateFmt), Total: int(total), Hits: hitsPtr, List: struct {
 		Number  int         `xml:"number,attr"`
 		Records []recordXML `xml:"record"`
 	}{len(items), items}}, nil)

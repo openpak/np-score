@@ -11,12 +11,10 @@ import (
 	"openpak/np-common/coreclient"
 	"openpak/np-common/nphttp"
 	"openpak/np-common/ticket"
-	"openpak/np-score/internal/rankingsapi"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
 )
 
 func main() {
@@ -28,9 +26,9 @@ func main() {
 
 func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dbURL := os.Getenv("NP_SCORE_DATABASE_URL")
-	if dbURL == "" {
-		return fmt.Errorf("NP_SCORE_DATABASE_URL must be set")
+	lbAddr, lbKey := os.Getenv("NP_LEADERBOARDS_ADDR"), os.Getenv("NP_LEADERBOARDS_KEY")
+	if lbAddr == "" || lbKey == "" {
+		return fmt.Errorf("NP_LEADERBOARDS_ADDR and NP_LEADERBOARDS_KEY must be set")
 	}
 	if len(os.Getenv("NP_CORE_KEY")) < 32 {
 		return fmt.Errorf("NP_CORE_KEY must be at least 32 bytes")
@@ -51,15 +49,11 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(ctx, dbURL)
+	lb, lbConn, err := DialLeaderboards(lbAddr, lbKey)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	store := &Store{DB: pool}
-	if err := store.Migrate(ctx); err != nil {
-		return err
-	}
+	defer lbConn.Close()
 	core, err := coreclient.Dial(nphttp.Env("NP_CORE_ADDR", "localhost:7000"), os.Getenv("NP_CORE_KEY"))
 	if err != nil {
 		return err
@@ -69,11 +63,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	svc := &Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey, Titles: titles,
+	svc := &Service{Core: core, Tickets: signer, LB: lb, ResourceKey: resourceKey, Titles: titles,
 		RecordFQDN: nphttp.Env("NP_RANKING_RECORD_FQDN", "ranking-record.np.community.playstation.net"),
 		ViewFQDN:   nphttp.Env("NP_RANKING_VIEW_FQDN", "ranking-view.np.community.playstation.net"), Log: log}
 	log.Info("score titles loaded", "count", len(titles))
-	rankingsapi.Serve(os.Getenv("RANKINGS_ADDR"), "np", rankingSource{store: store, titles: titles})
+	// Declare the configured boards to the leaderboards service; Submit carries the policy too, so
+	// a service that is down at start only delays the names and limits.
+	go func() {
+		for {
+			if err := svc.SyncBoards(ctx); err == nil {
+				return
+			} else {
+				log.Warn("leaderboards board sync", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+		}
+	}()
 	mux := http.NewServeMux()
 	svc.Register(mux)
 	nphttp.Health(mux)
